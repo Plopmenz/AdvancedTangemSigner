@@ -7,66 +7,138 @@ import { spacing } from "../theme"
 import TangemSdk, { Card } from "tangem-sdk-react-native"
 import { FeeMarketEIP1559Transaction } from "@ethereumjs/tx"
 import { Buffer } from "@craftzdog/react-native-buffer"
+import { publicToAddress } from "@ethereumjs/util"
+import axios from "axios"
 
 interface HomeProps extends AppStackScreenProps<"Home"> {}
 
 export const Home: FC<HomeProps> = observer(function Home(_props) {
   const [card, setCard] = useState<Card | undefined>()
 
-  TangemSdk.startSession({})
+  interface RPCPayload {
+    method: string
+    params?: any[]
+  }
+  async function rpcRequest(payload: RPCPayload) {
+    const endPoint = "https://sepolia.infura.io/v3/"
+    const response = await axios
+      .post(endPoint, { jsonrpc: "2.0", id: 1, ...payload })
+      .catch(console.error)
+    if (!response) {
+      throw new Error("RPC request failed")
+    }
+    return response.data.result
+  }
+
   async function scanCard() {
     const scannedCard = await TangemSdk.scanCard()
     setCard(scannedCard)
   }
 
-  async function signHash(withCard: Card) {
-    const transactionData = {
-      chainId: BigInt(1),
-      to: "0x2309762aAcA0a8F689463a42c0A6A84BE3A7ea51",
+  async function generateTransaction(forAddress: string) {
+    const transactionBase = {
+      to: forAddress,
       value: BigInt(0),
-      data: "0x",
-      gasLimit: BigInt(21000),
+      data: "0x" + Buffer.from("Hello!").toString("hex"),
     }
+    const rpcChainId = await rpcRequest({ method: "eth_chainId" })
+    const rpcGasEstimate = await rpcRequest({
+      method: "eth_estimateGas",
+      params: [
+        { from: forAddress, ...transactionBase, value: "0x" + transactionBase.value.toString(16) },
+        "latest",
+      ],
+    })
+    const transactionData = {
+      chainId: BigInt(rpcChainId),
+      gasLimit: BigInt(rpcGasEstimate),
+      ...transactionBase,
+    }
+
+    const rpcNonce = await rpcRequest({
+      method: "eth_getTransactionCount",
+      params: [forAddress, "latest"],
+    })
+    const rpcGasPrice = await rpcRequest({ method: "eth_gasPrice" })
     const transactionSettings = {
-      nonce: BigInt(0),
-      maxFeePerGas: BigInt(0),
-      maxPriorityFeePerGas: BigInt(0),
+      nonce: BigInt(rpcNonce),
+      maxFeePerGas: BigInt(rpcGasPrice),
+      maxPriorityFeePerGas: BigInt(1), // 1 wei
       type: "0x02",
     }
 
+    return { ...transactionData, ...transactionSettings }
+  }
+
+  async function signHash(withCard: Card, withWallet: number) {
+    const wallet = withCard.wallets[withWallet]
+    if (wallet.curve !== "secp256k1") {
+      throw new Error(
+        `Wallet using non-supported curve ${wallet.curve}. Please provide a wallet with secp256k1 curve.`,
+      )
+    }
+    const address = Buffer.from(
+      publicToAddress(Buffer.from(wallet.publicKey, "hex"), true),
+    ).toString("hex")
+
+    const transactionInfo = await generateTransaction("0x" + address)
+
     const unsignedTransaction = FeeMarketEIP1559Transaction.fromTxData({
       // https://github.com/ethereumjs/ethereumjs-monorepo/blob/master/packages/tx/src/eip1559Transaction.ts
-      chainId: transactionData.chainId,
-      to: transactionData.to,
-      value: transactionData.value,
-      data: transactionData.data,
-      gasLimit: transactionData.gasLimit,
-      nonce: transactionSettings.nonce,
-      maxFeePerGas: transactionSettings.maxFeePerGas,
-      maxPriorityFeePerGas: transactionSettings.maxPriorityFeePerGas,
-      type: transactionSettings.type,
+      // Could use transactionInfo directly, explicit for reduced chance of mistakes
+      chainId: transactionInfo.chainId,
+      to: transactionInfo.to,
+      value: transactionInfo.value,
+      data: transactionInfo.data,
+      gasLimit: transactionInfo.gasLimit,
+      nonce: transactionInfo.nonce,
+      maxFeePerGas: transactionInfo.maxFeePerGas,
+      maxPriorityFeePerGas: transactionInfo.maxPriorityFeePerGas,
+      type: transactionInfo.type,
     })
-    const toSign = Buffer.from(unsignedTransaction.getMessageToSign()).toString("hex")
+    const toSign = Buffer.from(unsignedTransaction.getHashedMessageToSign()).toString("hex")
 
     const tangemSign = await TangemSdk.sign({
       // Tangem React Native SDK doesnt support signing a single hash
       hashes: [toSign, toSign] as any as [string], // mistake in the Tangem SDK ? Should be string[] ?
       cardId: withCard.cardId,
-      walletPublicKey: withCard.wallets[0].publicKey,
+      walletPublicKey: wallet.publicKey,
     })
     const signature = tangemSign.signatures[0]
-    const recovery = BigInt(0) // Tangem card doesnt return this value ?
+    const recovery = BigInt(0) // Tangem card doesnt return this value, try both and see what address matches
 
-    const transaction = FeeMarketEIP1559Transaction.fromTxData({
+    const transaction0 = FeeMarketEIP1559Transaction.fromTxData({
       // https://github.com/ethereumjs/ethereumjs-monorepo/blob/master/packages/util/src/signature.ts
       ...unsignedTransaction,
       v: recovery, // + transactionData.chainId * BigInt(2) + BigInt(35),
       r: BigInt("0x" + signature.substring(0, 64)),
       s: BigInt("0x" + signature.substring(64, 128)),
     })
+    const transaction1 = FeeMarketEIP1559Transaction.fromTxData({
+      ...unsignedTransaction,
+      v: BigInt(1),
+      r: BigInt("0x" + signature.substring(0, 64)),
+      s: BigInt("0x" + signature.substring(64, 128)),
+    })
 
-    console.log(transaction.verifySignature())
-    console.log(transaction.getValidationErrors())
+    let transaction: FeeMarketEIP1559Transaction
+    if (Buffer.from(transaction0.getSenderAddress().bytes).toString("hex") === address) {
+      transaction = transaction0
+    } else if (Buffer.from(transaction1.getSenderAddress().bytes).toString("hex") === address) {
+      transaction = transaction1
+    } else {
+      throw new Error("Signed message does not match address")
+    }
+
+    if (transaction.verifySignature()) {
+      console.log("Succesfully signed transaction!")
+    }
+
+    const transactionHash = await rpcRequest({
+      method: "eth_sendRawTransaction",
+      params: ["0x" + Buffer.from(transaction.serialize()).toString("hex")],
+    })
+    console.log("Transaction hash:", transactionHash)
   }
 
   return (
@@ -98,7 +170,9 @@ export const Home: FC<HomeProps> = observer(function Home(_props) {
         style={$tapButton}
         preset="reversed"
         onPress={
-          card ? () => signHash(card).catch(console.error) : () => console.error("Scan card first")
+          card
+            ? () => signHash(card, 0).catch(console.error)
+            : () => console.error("Scan card first")
         }
       />
     </Screen>
